@@ -18,8 +18,13 @@ limitations under the License.
 
 #include <stdio.h>
 #include <ctype.h>
+#include <time.h>
 
 #include <config.h>
+
+#if defined(HAVE_LIBCRYPTO) && defined(HAVE_WINCRYPT)
+#error "Cannot defined both HAVE_LIBCRYPTO and HAVE_WINCRYPT"
+#endif
 
 #if defined(HAVE_LIBCRYPTO)
 #include <openssl/md5.h>
@@ -29,6 +34,11 @@ limitations under the License.
 #include <openssl/bio.h>
 #include <openssl/pkcs7.h>
 #include <openssl/x509.h>
+#elif defined(HAVE_WINCRYPT)
+#pragma comment(lib, "crypt32.lib")
+#include <windows.h>
+#include <wincrypt.h>
+#define MD5_DIGEST_LENGTH 16
 #endif
 
 #include <yara/pe.h>
@@ -807,7 +817,17 @@ IMPORTED_DLL* pe_parse_imports(
   return head;
 }
 
-#if defined(HAVE_LIBCRYPTO)
+#if defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
+
+time_t FileTime_to_POSIX(const FILETIME* ft)
+{
+  LARGE_INTEGER date, adjust;
+  date.HighPart = ft->dwHighDateTime;
+  date.LowPart = ft->dwLowDateTime;
+  adjust.QuadPart = 11644473600000 * 10000;
+  date.QuadPart -= adjust.QuadPart;
+  return date.QuadPart / 10000000;
+}
 
 void pe_parse_certificates(
     PE* pe)
@@ -869,6 +889,7 @@ void pe_parse_certificates(
       continue;
     }
 
+#if defined(HAVE_LIBCRYPTO)
     BIO* cert_bio = BIO_new_mem_buf(win_cert->Certificate, win_cert->Length);
 
     if (!cert_bio)
@@ -947,18 +968,136 @@ void pe_parse_certificates(
       counter++;
     }
 
-    uintptr_t end = (uintptr_t)((uint8_t *) win_cert) + win_cert->Length;
-    win_cert = (PWIN_CERTIFICATE)(end + (end % 8));
-
     BIO_free(cert_bio);
     sk_X509_free(certs);
+#endif  // defined(HAVE_LIBCRYPTO)
+
+#if defined(HAVE_WINCRYPT)
+    DWORD signer_count = 0;
+    signer_count = CryptGetMessageSignerCount(
+                              X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                              win_cert->Certificate,
+                              win_cert->Length);
+    if (signer_count == 0)
+      continue;
+
+    HCERTSTORE cert_store = NULL;
+    HCRYPTMSG cert_msg = NULL;
+    PCCERT_CONTEXT next_cert = NULL;
+    CERT_BLOB cert_blob;
+    cert_blob.pbData = win_cert->Certificate;
+    cert_blob.cbData = win_cert->Length;
+    BOOL success = CryptQueryObject(
+      CERT_QUERY_OBJECT_BLOB,
+      &cert_blob,
+      CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
+      CERT_QUERY_FORMAT_FLAG_BINARY,
+      0,
+      NULL,
+      NULL,
+      NULL,
+      &cert_store,
+      &cert_msg,
+      NULL);
+    if (!success)
+      continue;
+
+    for (int signer_id = 0; signer_id < signer_count; ++signer_id) {
+      DWORD cert_info_size = 0;
+      CryptMsgGetParam(cert_msg,
+                       CMSG_SIGNER_CERT_INFO_PARAM,
+                       signer_id,
+                       NULL,
+                       &cert_info_size);
+      PCERT_INFO pSignerInfo = (PCERT_INFO) yr_malloc(cert_info_size);
+      CryptMsgGetParam(cert_msg,
+                       CMSG_SIGNER_CERT_INFO_PARAM,
+                       0,
+                       pSignerInfo,
+                       &cert_info_size);
+
+      PCCERT_CONTEXT certificate =
+          CertFindCertificateInStore(cert_store,
+                                     X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                     0,
+                                     CERT_FIND_SUBJECT_CERT,
+                                     (PVOID)pSignerInfo,
+                                     NULL);
+      if (certificate) {
+        char buffer[1024];
+
+        CertNameToStr(
+            certificate->dwCertEncodingType,
+            &certificate->pCertInfo->Subject,
+            CERT_X500_NAME_STR, buffer, sizeof(buffer));
+        set_string(buffer, pe->object, "signatures[%i].subject", counter);
+        //printf("signatures[%d].subject: %s\n", counter, buffer);
+
+        CertNameToStr(
+            certificate->dwCertEncodingType,
+            &certificate->pCertInfo->Issuer,
+            CERT_X500_NAME_STR, buffer, sizeof(buffer));
+        set_string(buffer, pe->object, "signatures[%i].issuer", counter);
+        //printf("signatures[%d].issuer: %s\n", counter, buffer);
+
+        set_integer(
+            certificate->pCertInfo->dwVersion + 1,
+            pe->object,
+            "signatures[%i].version", counter);
+        //printf("signatures[%i].version: %d\n", counter, certificate->pCertInfo->dwVersion);
+
+        unsigned char* serial_data =
+            (unsigned char*)certificate->pCertInfo->SerialNumber.pbData;
+        DWORD serial_length = certificate->pCertInfo->SerialNumber.cbData;
+        char* serial_number = (char *) yr_malloc(serial_length * 3);
+        if (serial_number != NULL)
+        {
+          for (int j = 0; j < serial_length; j++)
+          {
+            // Don't put the colon on the last one.
+            unsigned char c = serial_data[serial_length - j - 1];
+            if (j < serial_length - 1)
+              snprintf(serial_number + 3 * j, 4, "%02x:", c);
+            else
+              snprintf(serial_number + 3 * j, 3, "%02x", c);
+          }
+
+          set_string(
+              serial_number, pe->object, "signatures[%i].serial", counter);
+          //printf("signatures[%i].serial: %s\n", counter, serial_number);
+
+          yr_free(serial_number);
+        }
+
+        if (strcmp(certificate->pCertInfo->SignatureAlgorithm.pszObjId, szOID_RSA_SHA1RSA) == 0)
+          set_string("sha1withRSAEncryption", pe->object, "signatures[%i].algorithm", counter);
+        else
+          set_string(certificate->pCertInfo->SignatureAlgorithm.pszObjId, pe->object, "signatures[%i].algorithm", counter);
+
+        time_t not_before = FileTime_to_POSIX(&certificate->pCertInfo->NotBefore);
+        set_integer(not_before, pe->object, "signatures[%i].not_before", counter);
+
+        time_t not_after = FileTime_to_POSIX(&certificate->pCertInfo->NotAfter);
+        set_integer(not_after, pe->object, "signatures[%i].not_after", counter);
+
+        counter++;
+      }
+
+      CertFreeCertificateContext(certificate);
+    }
+
+    CertCloseStore(cert_store, 0);
+    CryptMsgClose(cert_msg);
+#endif  // defined(HAVE_WINCRYPT)
+
+    uintptr_t end = (uintptr_t)((uint8_t *) win_cert) + win_cert->Length;
+    win_cert = (PWIN_CERTIFICATE)(end + (end % 8));
   }
 
   set_integer(counter, pe->object, "number_of_signatures");
 }
 
-#endif  // defined(HAVE_LIBCRYPTO)
-
+#endif  // defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
 
 void pe_parse_header(
     PE* pe,
@@ -1186,7 +1325,7 @@ define_function(exports)
 }
 
 
-#if defined(HAVE_LIBCRYPTO)
+#if defined(HAVE_LIBCRYPTO) || defined (HAVE_WINCRYPT)
 
 //
 // Generate an import hash:
@@ -1201,7 +1340,13 @@ define_function(imphash)
   IMPORTED_DLL* dll = NULL;
   IMPORTED_FUNCTION* func = NULL;
 
+#if defined(HAVE_LIBCRYPTO)
   MD5_CTX ctx;
+#elif defined (HAVE_WINCRYPT)
+  HCRYPTPROV hProv = 0;
+  HCRYPTHASH hHash = 0;
+  DWORD cbHash = 0;
+#endif
 
   unsigned char digest[MD5_DIGEST_LENGTH];
   char digest_ascii[MD5_DIGEST_LENGTH * 2 + 1];
@@ -1214,7 +1359,25 @@ define_function(imphash)
   if (!pe)
     return_string(UNDEFINED);
 
+#if defined(HAVE_LIBCRYPTO)
   MD5_Init(&ctx);
+#elif defined (HAVE_WINCRYPT)
+
+  if (!CryptAcquireContext(&hProv,
+                           NULL,
+                           NULL,
+                           PROV_RSA_FULL,
+                           CRYPT_VERIFYCONTEXT))
+  {
+    return_string(UNDEFINED);
+  }
+
+  if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash))
+  {
+    CryptReleaseContext(hProv, 0);
+    return_string(UNDEFINED);
+  }
+#endif
 
   dll = pe->imported_dlls;
 
@@ -1263,8 +1426,16 @@ define_function(imphash)
       for (int i = 0; i < final_name_len; i++)
         final_name[i] = tolower(final_name[i]);
 
+#if defined(HAVE_LIBCRYPTO)
       MD5_Update(&ctx, final_name, final_name_len);
-
+#elif defined (HAVE_WINCRYPT)
+      if (!CryptHashData(hHash, (const BYTE*)final_name, final_name_len, 0))
+      {
+        CryptReleaseContext(hProv, 0);
+        CryptDestroyHash(hHash);
+        return_string(UNDEFINED);
+      }
+#endif
       yr_free(final_name);
 
       func = func->next;
@@ -1275,7 +1446,19 @@ define_function(imphash)
     dll = dll->next;
   }
 
+#if defined(HAVE_LIBCRYPTO)
   MD5_Final(digest, &ctx);
+#elif defined (HAVE_WINCRYPT)
+  cbHash = MD5_DIGEST_LENGTH;
+  if (!CryptGetHashParam(hHash, HP_HASHVAL, digest, &cbHash, 0))
+  {
+    CryptReleaseContext(hProv, 0);
+    CryptDestroyHash(hHash);
+    return_string(UNDEFINED);
+  }
+  CryptReleaseContext(hProv, 0);
+  CryptDestroyHash(hHash);
+#endif
 
   // Transform the binary digest to ascii
 
@@ -1289,8 +1472,7 @@ define_function(imphash)
   return_string(digest_ascii);
 }
 
-#endif  // defined(HAVE_LIBCRYPTO)
-
+#endif  // defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
 
 define_function(imports)
 {
@@ -1492,7 +1674,7 @@ begin_declarations;
     declare_string("clear_data");
   end_struct("rich_signature");
 
-  #if defined(HAVE_LIBCRYPTO)
+  #if defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
   declare_function("imphash", "", "s", imphash);
   #endif
 
@@ -1502,7 +1684,7 @@ begin_declarations;
   declare_function("locale", "i", "i", locale);
   declare_function("language", "i", "i", language);
 
-  #if defined(HAVE_LIBCRYPTO)
+  #if defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
   begin_struct_array("signatures");
     declare_string("issuer");
     declare_string("subject");
@@ -1642,7 +1824,7 @@ int module_load(
         pe_parse_header(pe, block->base, context->flags);
         pe_parse_rich_signature(pe, block->base);
 
-        #if defined(HAVE_LIBCRYPTO)
+        #if defined(HAVE_LIBCRYPTO) || defined(HAVE_WINCRYPT)
         pe_parse_certificates(pe);
         #endif
 
